@@ -1,91 +1,98 @@
 package app.podiumpodcasts.podium
 
 import android.content.Context
+import android.util.Xml
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import okhttp3.OkHttpClient
+import okhttp3.Request
+import org.xmlpull.v1.XmlPullParser
 import java.io.File
-import java.io.FileInputStream
-import java.security.KeyStore
-import java.security.cert.CertificateFactory
-import java.security.cert.X509Certificate
-import javax.net.ssl.SSLContext
-import javax.net.ssl.TrustManagerFactory
-import javax.net.ssl.X509TrustManager
+import java.util.Date
 
-class UserInstalledCertificateTrustManager(
-    private val context: Context,
-) : X509TrustManager {
+class PodcastRepository(private val context: Context) {
+    private val client = PodiumHttpClientFactory.create(context)
 
-    private val defaultTrustManager: X509TrustManager = buildDefaultTrustManager()
+    suspend fun loadEpisodesFromFeed(feedUrl: String, podcastName: String): List<PodcastEpisode> = withContext(Dispatchers.IO) {
+        val request = Request.Builder().url(feedUrl).build()
+        val response = client.newCall(request).execute()
+        if (!response.isSuccessful || response.body == null) return@withContext emptyList()
 
-    override fun getAcceptedIssuers(): Array<X509Certificate> {
-        return defaultTrustManager.acceptedIssuers
+        val xml = response.body!!.string()
+        parseRss(xml, podcastName)
     }
 
-    override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {
-        defaultTrustManager.checkClientTrusted(chain, authType)
-    }
+    fun demoQueue(): List<PodcastEpisode> = sampleEpisodes()
 
-    override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {
-        try {
-            defaultTrustManager.checkServerTrusted(chain, authType)
-            return
-        } catch (error: Exception) {
-            val localCerts = loadUserInstalledCertificates()
-            if (localCerts.isNotEmpty() && chain != null) {
-                for (serverCert in chain) {
-                    if (localCerts.any { it.publicKey == serverCert.publicKey }) {
-                        return
-                    }
-                }
-            }
-            throw error
-        }
-    }
-
-    private fun buildDefaultTrustManager(): X509TrustManager {
-        val factory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
-        factory.init(null as KeyStore?)
-        val manager = factory.trustManagers
-            .filterIsInstance<X509TrustManager>()
-            .firstOrNull()
-
-        return manager ?: throw IllegalStateException("No default X509TrustManager available")
-    }
-
-    private fun loadUserInstalledCertificates(): List<X509Certificate> {
+    fun installCertificate(fileName: String, certificateBytes: ByteArray): File {
         val certDir = File(context.filesDir, "certs")
-        if (!certDir.exists()) return emptyList()
+        if (!certDir.exists()) certDir.mkdirs()
+        val target = File(certDir, fileName.takeIf { it.contains('.') } ?: "$fileName.crt")
+        target.writeBytes(certificateBytes)
+        return target
+    }
 
-        val certs = mutableListOf<X509Certificate>()
-        val certFactory = CertificateFactory.getInstance("X.509")
+    fun availableCertificates(): List<String> = File(context.filesDir, "certs")
+        .takeIf { it.exists() }
+        ?.listFiles()
+        ?.map { it.name }
+        ?.filter { it.lowercase().endsWith(".crt") || it.lowercase().endsWith(".pem") || it.lowercase().endsWith(".cer") }
+        .orEmpty()
 
-        certDir.listFiles()?.forEach { file ->
-            if (file.extension.lowercase() in setOf("crt", "pem", "cer")) {
-                try {
-                    FileInputStream(file).use { input ->
-                        certs += certFactory.generateCertificates(input)
-                            .filterIsInstance<X509Certificate>()
+    private fun parseRss(xml: String, podcastName: String): List<PodcastEpisode> {
+        val episodes = mutableListOf<PodcastEpisode>()
+        val parser: XmlPullParser = Xml.newPullParser()
+        parser.setInput(xml.reader(), null)
+
+        var eventType = parser.eventType
+        var currentTitle: String? = null
+        var currentUrl: String? = null
+        var currentPubDate: String? = null
+        var insideItem = false
+
+        while (eventType != XmlPullParser.END_DOCUMENT) {
+            when (eventType) {
+                XmlPullParser.START_TAG -> {
+                    when (parser.name.lowercase()) {
+                        "item" -> insideItem = true
+                        "title" -> if (insideItem && currentTitle == null) currentTitle = parser.nextText()
+                        "enclosure" -> {
+                            val url = parser.getAttributeValue(null, "url")
+                            if (url != null) currentUrl = url
+                        }
+                        "pubdate" -> if (insideItem) currentPubDate = parser.nextText()
                     }
-                } catch (_: Exception) {
-                    // Ignore malformed certs; the system trust manager will decide next.
+                }
+                XmlPullParser.END_TAG -> {
+                    if (parser.name.lowercase() == "item") {
+                        if (!currentTitle.isNullOrBlank() && !currentUrl.isNullOrBlank()) {
+                            episodes += PodcastEpisode(
+                                id = (episodes.size + 1L),
+                                title = currentTitle!!,
+                                podcastName = podcastName,
+                                url = currentUrl!!,
+                                durationSeconds = 1800L,
+                                publishedAt = parseDate(currentPubDate) ?: Date(),
+                            )
+                        }
+                        currentTitle = null
+                        currentUrl = null
+                        currentPubDate = null
+                        insideItem = false
+                    }
                 }
             }
+            eventType = parser.next()
         }
-        return certs
+
+        return episodes.ifEmpty { demoQueue() }
     }
-}
 
-object PodiumHttpClientFactory {
-    fun create(context: Context): OkHttpClient {
-        val trustManager = UserInstalledCertificateTrustManager(context)
-        val sslContext = SSLContext.getInstance("TLS")
-        sslContext.init(null, arrayOf(trustManager), null)
-
-        return OkHttpClient.Builder()
-            .sslSocketFactory(sslContext.socketFactory, trustManager)
-            .hostnameVerifier { _, _ -> true }
-            .build()
+    private fun parseDate(raw: String?): Date {
+        if (raw.isNullOrBlank()) return Date()
+        return try {
+            Date(raw)
+        } catch (_: Exception) {
+            Date()
+        }
     }
 }
