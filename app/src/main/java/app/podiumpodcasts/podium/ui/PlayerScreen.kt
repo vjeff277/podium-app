@@ -1,145 +1,143 @@
 package app.podiumpodcasts.podium.ui
 
-import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.material3.Button
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.getValue
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.unit.dp
+import android.app.Application
+import android.media.MediaPlayer
+import androidx.lifecycle.AndroidViewModel
 import app.podiumpodcasts.podium.PodcastEpisode
+import app.podiumpodcasts.podium.PodcastRepository
 import app.podiumpodcasts.podium.sampleEpisodes
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
-@Composable
-fun PlayerScreen(viewModel: PlayerViewModel) {
-    val uiState by viewModel.uiState.collectAsState()
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background)
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(text = "Podium", style = MaterialTheme.typography.headlineMedium)
-            Button(onClick = { viewModel.toggleQueue() }) {
-                Text("Queue")
-            }
-        }
-
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
-        ) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                Text(text = uiState.currentEpisode?.title ?: "No episode selected", style = MaterialTheme.typography.titleLarge)
-                Text(text = uiState.currentEpisode?.podcastName ?: "Select a podcast")
-                Text(text = "Now playing: ${uiState.currentEpisode?.title ?: "nothing"}")
-
-                if (uiState.currentEpisode != null) {
-                    Button(
-                        onClick = { viewModel.onEpisodeFinished() },
-                        modifier = Modifier.padding(top = 8.dp)
-                    ) {
-                        Text("Mark current as finished")
-                    }
-                }
-            }
-        }
-
-        if (uiState.isQueueVisible) {
-            QueueSheet(
-                queue = uiState.queue,
-                currentEpisodeId = uiState.currentEpisodeId,
-                onEpisodeSelected = viewModel::selectEpisode,
-                onRemove = viewModel::removeEpisode,
-                onClose = viewModel::toggleQueue
-            )
-        }
-    }
+data class PlayerUiState(
+    val queue: List<PodcastEpisode> = emptyList(),
+    val currentEpisodeId: Long? = null,
+    val isQueueVisible: Boolean = false,
+    val isPlaying: Boolean = false,
+) {
+    val currentEpisode: PodcastEpisode?
+        get() = queue.firstOrNull { it.id == currentEpisodeId }
 }
 
-@Composable
-private fun QueueSheet(
-    queue: List<PodcastEpisode>,
-    currentEpisodeId: Long?,
-    onEpisodeSelected: (PodcastEpisode) -> Unit,
-    onRemove: (Long) -> Unit,
-    onClose: () -> Unit,
-) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("Queue", style = MaterialTheme.typography.titleLarge)
-                Text(
-                    text = "Close",
-                    modifier = Modifier.clickable { onClose() },
-                    color = MaterialTheme.colorScheme.primary
-                )
+class PlayerViewModel(application: Application) : AndroidViewModel(application) {
+    private val repository = PodcastRepository(application.applicationContext)
+    private var mediaPlayer: MediaPlayer? = null
+
+    private val _uiState = MutableStateFlow(
+        PlayerUiState(
+            queue = repository.demoQueue(),
+            currentEpisodeId = repository.demoQueue().firstOrNull()?.id,
+            isQueueVisible = false,
+            isPlaying = false,
+        )
+    )
+    val uiState: StateFlow<PlayerUiState> = _uiState.asStateFlow()
+
+    init {
+        val initialQueue = _uiState.value.queue
+        if (initialQueue.isNotEmpty()) {
+            selectEpisode(initialQueue.first(), autoplay = false)
+        }
+    }
+
+    fun toggleQueue() {
+        _uiState.value = _uiState.value.copy(isQueueVisible = !_uiState.value.isQueueVisible)
+    }
+
+    fun moveEpisode(fromIndex: Int, toIndex: Int) {
+        val queue = _uiState.value.queue.toMutableList()
+        if (fromIndex !in queue.indices || toIndex !in queue.indices) return
+
+        val item = queue.removeAt(fromIndex)
+        queue.add(toIndex, item)
+
+        val currentEpisodeId = _uiState.value.currentEpisodeId
+        _uiState.value = _uiState.value.copy(queue = queue, currentEpisodeId = currentEpisodeId)
+    }
+
+    fun selectEpisode(episode: PodcastEpisode, autoplay: Boolean = true) {
+        _uiState.value = _uiState.value.copy(
+            currentEpisodeId = episode.id,
+            isQueueVisible = false,
+        )
+        if (autoplay) {
+            playEpisode(episode)
+        }
+    }
+
+    fun removeEpisode(id: Long) {
+        val currentQueue = _uiState.value.queue
+        val nextQueue = currentQueue.filterNot { it.id == id }
+        val current = _uiState.value.currentEpisodeId
+        val nextCurrent = when {
+            current == id -> nextQueue.firstOrNull()?.id
+            current != null -> current
+            else -> null
+        }
+
+        if (nextQueue.isNotEmpty() && nextCurrent == null) {
+            _uiState.value = _uiState.value.copy(queue = nextQueue, currentEpisodeId = nextQueue.first().id)
+            return
+        }
+
+        _uiState.value = _uiState.value.copy(
+            queue = nextQueue,
+            currentEpisodeId = nextCurrent,
+            isQueueVisible = true,
+        )
+    }
+
+    fun playPause() {
+        val current = _uiState.value.currentEpisode ?: return
+        if (_uiState.value.isPlaying) {
+            mediaPlayer?.pause()
+            _uiState.value = _uiState.value.copy(isPlaying = false)
+            return
+        }
+        playEpisode(current)
+    }
+
+    fun onEpisodeFinished() {
+        val queue = _uiState.value.queue
+        val currentIndex = queue.indexOfFirst { it.id == _uiState.value.currentEpisodeId }
+
+        if (currentIndex >= 0 && currentIndex < queue.lastIndex) {
+            val nextEpisode = queue[currentIndex + 1]
+            selectEpisode(nextEpisode, autoplay = true)
+        } else {
+            stopPlayback()
+        }
+    }
+
+    private fun playEpisode(episode: PodcastEpisode) {
+        stopPlayback()
+        mediaPlayer = MediaPlayer().apply {
+            setOnCompletionListener {
+                onEpisodeFinished()
             }
-
-            Spacer(modifier = Modifier.height(8.dp))
-
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(queue) { episode ->
-                    val isCurrent = episode.id == currentEpisodeId
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(
-                                if (isCurrent) MaterialTheme.colorScheme.primaryContainer
-                                else Color.Transparent
-                            )
-                            .clickable { onEpisodeSelected(episode) }
-                            .padding(12.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column {
-                            Text(episode.title)
-                            Text(
-                                text = if (isCurrent) "Now playing" else "Queued",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = if (isCurrent) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                        Text(
-                            text = "Remove",
-                            modifier = Modifier.clickable { onRemove(episode.id) },
-                            color = MaterialTheme.colorScheme.error
-                        )
-                    }
-                }
+            setDataSource(episode.url)
+            prepareAsync()
+            setOnPreparedListener {
+                start()
+                _uiState.value = _uiState.value.copy(isPlaying = true)
+            }
+            setOnErrorListener { _, _, _ ->
+                _uiState.value = _uiState.value.copy(isPlaying = false)
+                true
             }
         }
+    }
+
+    private fun stopPlayback() {
+        mediaPlayer?.stop()
+        mediaPlayer?.release()
+        mediaPlayer = null
+        _uiState.value = _uiState.value.copy(isPlaying = false)
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        stopPlayback()
     }
 }
